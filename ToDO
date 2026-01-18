@@ -1,3 +1,4 @@
 Zestawienia - poszukać gotowej iblioteki do wykresów
 Dodać zestawienie jaki klient kupił ile paliwa
 Zapłata - paragon albo faktura (faktura trzeba podać dane do faktury i zapisać je w pliku json)iphone 
+Upewnij się, że wykonałeś komendę dotnet add package ScottPlot --version 4.1.71 w terminalu.
