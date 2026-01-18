@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using ScottPlot;
 
 namespace StacjaBenzynowa
 {
@@ -11,48 +12,40 @@ namespace StacjaBenzynowa
     {
         private List<Transakcja> _baza = new();
         private Dictionary<RodzajPaliwa, decimal> _ceny;
-        private Transakcja _aktywna; //Bieżące, jeszcze nie zakończone tankowanie
+        private Transakcja _aktywna;
 
         private const string PlikBazy = "baza.json";
         private const string PlikCennik = "ceny.json";
 
         public event Action<Transakcja> Kradziez;
+        public bool CzyJestAktywna => _aktywna != null && !_aktywna.Oplacona;
 
         public Dystrybutor() => InicjujCennik();
 
-        //Obsługa danych
+        // --- OBSŁUGA DANYCH ---
         private void InicjujCennik()
         {
             var json = File.ReadAllText(PlikCennik);
-            
             var opcje = new JsonSerializerOptions 
             { 
                 Converters = { new JsonStringEnumConverter() },
                 PropertyNameCaseInsensitive = true
             };
-            //Zamiana tekstu JSON na obiekt Dictionary (Słownik)
             _ceny = JsonSerializer.Deserialize<Dictionary<RodzajPaliwa, decimal>>(json, opcje);
         }
 
         public void WczytajBaze()
         {
             var json = File.ReadAllText(PlikBazy);
-            
-            var opcje = new JsonSerializerOptions 
-            { 
-                Converters = { new JsonStringEnumConverter() } 
-            };
+            if (string.IsNullOrWhiteSpace(json)) return;
 
+            var opcje = new JsonSerializerOptions { Converters = { new JsonStringEnumConverter() } };
             _baza = JsonSerializer.Deserialize<List<Transakcja>>(json, opcje) ?? new List<Transakcja>();
         }
 
         private void Zapisz()
         {
-            var opcje = new JsonSerializerOptions 
-            { 
-                WriteIndented = true, 
-                Converters = { new JsonStringEnumConverter() } 
-            };
+            var opcje = new JsonSerializerOptions { WriteIndented = true, Converters = { new JsonStringEnumConverter() } };
             var json = JsonSerializer.Serialize(_baza, opcje);
             File.WriteAllText(PlikBazy, json);
         }
@@ -60,29 +53,36 @@ namespace StacjaBenzynowa
         // --- LOGIKA ---
         public void Tankuj(RodzajPaliwa typ, double litry)
         {
-            // Jeśli ktoś zaczął nowe tankowanie, a poprzednie nie jest opłacone -> kradzież
             if (_aktywna != null && !_aktywna.Oplacona) Odjazd();
 
             var cena = _ceny[typ];
             var suma = cena * (decimal)litry;
 
-            //Tworzenie nowej transakcji
             _aktywna = new Transakcja
             {
                 Id = Guid.NewGuid(), Data = DateTime.Now, Paliwo = typ,
-                Litry = litry, Cena = cena, Kwota = suma, Oplacona = false
+                Litry = litry, Cena = cena, Kwota = suma, Oplacona = false,
+                CzyFaktura = false
             };
 
             Console.WriteLine($"\n[Dystrybutor] {litry}L {typ} (x{cena:C}). Razem: {suma:C}");
         }
 
-        public void Zaplac()
+        public void Zaplac(string nabywca = null, string adres = null, string nip = null)
         {
             if (_aktywna == null || _aktywna.Oplacona) return;
 
-            Console.WriteLine("[Terminal] Płatność OK.");
+            if (!string.IsNullOrEmpty(nip))
+            {
+                _aktywna.CzyFaktura = true;
+                _aktywna.Nabywca = nabywca;
+                _aktywna.Adres = adres;
+                _aktywna.Nip = nip;
+                Console.WriteLine($"[Dokument] Wystawiono FAKTURĘ dla: {nabywca}");
+            }
+            else Console.WriteLine("[Dokument] Wystawiono PARAGON.");
+
             _aktywna.Oplacona = true;
-            
             _baza.Add(_aktywna);
             Zapisz();
             _aktywna = null;
@@ -91,50 +91,115 @@ namespace StacjaBenzynowa
         public void Odjazd()
         {
             if (_aktywna == null) return;
-
-            if (_aktywna.Oplacona)
-            {
-                _aktywna = null;
-            }
+            if (_aktywna.Oplacona) _aktywna = null;
             else
             {
                 _baza.Add(_aktywna);
                 Zapisz();
-                Kradziez?.Invoke(_aktywna); //Wywołania zdarzenia kradzież
+                Kradziez?.Invoke(_aktywna);
                 _aktywna = null;
             }
         }
 
-        // --- RAPORTY (LINQ) ---
+        // --- RAPORTY ---
         public void RaportIlosciowy()
         {
             Console.WriteLine("\n--- RAPORT ILOŚCIOWY ---");
-            // LINQ: Filtrujemy tylko opłacone -> Grupujemy po paliwie -> Sumujemy litry i kwoty
-            var dane = _baza.Where(x => x.Oplacona)
-                            .GroupBy(x => x.Paliwo)
-                            .Select(g => new { Typ = g.Key, Litry = g.Sum(x => x.Litry), Kasa = g.Sum(x => x.Kwota) });
+            
+            var daneLista = _baza.Where(x => x.Oplacona)
+                                 .GroupBy(x => x.Paliwo)
+                                 .Select(g => new 
+                                 { 
+                                     Typ = g.Key, 
+                                     Nazwa = g.Key.ToString(),
+                                     Litry = g.Sum(x => x.Litry), 
+                                     Kasa = g.Sum(x => x.Kwota) 
+                                 })
+                                 .ToList();
 
-            foreach (var d in dane)
+            if (daneLista.Count == 0)
+            {
+                Console.WriteLine("Brak danych.");
+                return;
+            }
+
+            foreach (var d in daneLista)
                 Console.WriteLine($"{d.Typ,-6} | {d.Litry,8:F2} L | {d.Kasa,8:C}");
+
+            //Generowanie wykresu
+            try 
+            {
+                double[] wartosci = daneLista.Select(x => x.Litry).ToArray();
+                string[] etykiety = daneLista.Select(x => x.Nazwa).ToArray();
+                double[] pozycje = DataGen.Consecutive(wartosci.Length);
+
+                var plt = new ScottPlot.Plot(600, 400);
+                plt.AddBar(wartosci, pozycje);
+                plt.XTicks(pozycje, etykiety);
+                plt.Title("Sprzedaż paliwa (Litry)");
+                plt.YLabel("Ilość [L]");
+                plt.XLabel("Rodzaj paliwa");
+
+                string dataStr = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+                string nazwaPliku = $"wykres_sprzedazy_{dataStr}.png";
+                
+                plt.SaveFig(nazwaPliku);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[WYKRES] Wygenerowano plik: {nazwaPliku}");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[OSTRZEŻENIE] Nie udało się stworzyć wykresu: {ex.Message}");
+            }
         }
 
         public void RaportKwotowy(decimal minKwota)
         {
             Console.WriteLine($"\n--- RAPORT > {minKwota:C} ---");
-            // LINQ: Filtrujemy kwoty większe niż X -> Sortujemy od najnowszych
-            var lista = _baza.Where(x => x.Kwota > minKwota)
-                             .OrderByDescending(x => x.Data)
-                             .ToList();
+            var lista = _baza.Where(x => x.Kwota > minKwota).OrderByDescending(x => x.Data).ToList();
 
-            Console.WriteLine($"{"DATA",-16} | {"TYP",-6} | {"KWOTA",-9} | STATUS");
-            Console.WriteLine(new string('-', 50));
+            Console.WriteLine($"{"DATA",-16} | {"DOKUMENT",-10} | {"KWOTA",-9} | STATUS");
+            Console.WriteLine(new string('-', 55));
 
             foreach (var t in lista)
             {
-                // Kolorujemy na czerwono, jeśli to kradzież
                 if (!t.Oplacona) Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"{t.Data,-16:yyyy-MM-dd HH:mm} | {t.Paliwo,-6} | {t.Kwota,9:C} | {(t.Oplacona ? "OK" : "! KRADZIEŻ !")}");
+                string dok = t.CzyFaktura ? "FAKTURA" : "PARAGON";
+                Console.WriteLine($"{t.Data,-16:yyyy-MM-dd HH:mm} | {dok,-10} | {t.Kwota,9:C} | {(t.Oplacona ? "OK" : "! KRADZIEŻ !")}");
+                if (t.CzyFaktura)
+                {
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"   -> Klient: {t.Nabywca} (NIP: {t.Nip})");
+                }
                 Console.ResetColor();
+            }
+        }
+
+        public void RaportTopKlientow()
+        {
+            Console.WriteLine("\n--- TOP 3 KLIENTÓW (WG LITRÓW) ---");
+            var ranking = _baza
+                .Where(t => t.CzyFaktura && t.Oplacona && !string.IsNullOrEmpty(t.Nabywca))
+                .GroupBy(t => t.Nabywca)
+                .Select(g => new { Klient = g.Key, SumaLitrow = g.Sum(x => x.Litry), SumaWydatkow = g.Sum(x => x.Kwota) })
+                .OrderByDescending(x => x.SumaLitrow)
+                .Take(3)
+                .ToList();
+
+            if (ranking.Count == 0)
+            {
+                Console.WriteLine("Brak danych o klientach.");
+                return;
+            }
+
+            int m = 1;
+            foreach (var r in ranking)
+            {
+                Console.WriteLine($"{m}. {r.Klient}");
+                Console.WriteLine($"   Zatankowano: {r.SumaLitrow:F2} L | Wydano: {r.SumaWydatkow:C}");
+                m++;
             }
         }
     }
